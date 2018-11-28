@@ -141,6 +141,12 @@ def see(hass: HomeAssistantType, mac: str = None, dev_id: str = None,
     hass.services.call(DOMAIN, SERVICE_SEE, data)
 
 
+@bind_hass
+async def async_see(hass: HomeAssistantType, **kwargs):
+    """See a device."""
+    await hass.data[DOMAIN].async_see(**kwargs)
+
+
 async def async_setup(hass: HomeAssistantType, config: ConfigType):
     """Set up the device tracker."""
     yaml_path = hass.config.path(YAML_DEVICES)
@@ -155,7 +161,7 @@ async def async_setup(hass: HomeAssistantType, config: ConfigType):
         track_new = defaults.get(CONF_TRACK_NEW, DEFAULT_TRACK_NEW)
 
     devices = await async_load_config(yaml_path, hass, consider_home)
-    tracker = DeviceTracker(
+    hass.data[DOMAIN] = tracker = DeviceTracker(
         hass, consider_home, track_new, defaults, devices)
 
     async def async_setup_platform(p_type, p_config, disc_info=None):

@@ -115,15 +115,6 @@ class WebhookFlowHandler(config_entries.ConfigFlow):
         if not self._allow_multiple and self._async_current_entries():
             return self.async_abort(reason='one_instance_allowed')
 
-        try:
-            url_parts = urlparse(self.hass.config.api.base_url)
-
-            if is_local(ip_address(url_parts.hostname)):
-                return self.async_abort(reason='not_internet_accessible')
-        except ValueError:
-            # If it's not an IP address, it's very likely publicly accessible
-            pass
-
         if user_input is None:
             return self.async_show_form(
                 step_id='user',
