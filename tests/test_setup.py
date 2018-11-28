@@ -481,6 +481,14 @@ async def test_when_setup_already_loaded(hass):
     await hass.async_block_till_done()
     assert calls == ['test']
 
+    # Event listener should be gone
+    hass.bus.async_fire(EVENT_COMPONENT_LOADED, {
+        'component': 'test'
+    })
+    await hass.async_block_till_done()
+    assert calls == ['test']
+
+    # Should be called right away
     setup.async_when_setup(hass, 'test', mock_callback)
     await hass.async_block_till_done()
     assert calls == ['test', 'test']
