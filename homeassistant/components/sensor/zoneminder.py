@@ -42,19 +42,21 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the ZoneMinder sensor platform."""
     include_archived = config.get(CONF_INCLUDE_ARCHIVED)
 
-    zm_client = hass.data[ZONEMINDER_DOMAIN]
-    monitors = zm_client.get_monitors()
-    if not monitors:
-        _LOGGER.warning('Could not fetch any monitors from ZoneMinder')
-
     sensors = []
-    for monitor in monitors:
-        sensors.append(ZMSensorMonitors(monitor))
+    for zm_client in hass.data[ZONEMINDER_DOMAIN].values():
+        monitors = zm_client.get_monitors()
+        if not monitors:
+            _LOGGER.warning('Could not fetch any monitors from ZoneMinder')
 
-        for sensor in config[CONF_MONITORED_CONDITIONS]:
-            sensors.append(ZMSensorEvents(monitor, include_archived, sensor))
+        for monitor in monitors:
+            sensors.append(ZMSensorMonitors(monitor))
 
-    sensors.append(ZMSensorRunState(zm_client))
+            for sensor in config[CONF_MONITORED_CONDITIONS]:
+                sensors.append(
+                    ZMSensorEvents(monitor, include_archived, sensor)
+                )
+
+        sensors.append(ZMSensorRunState(zm_client))
     add_entities(sensors)
 
 
@@ -64,7 +66,8 @@ class ZMSensorMonitors(Entity):
     def __init__(self, monitor):
         """Initialize monitor sensor."""
         self._monitor = monitor
-        self._state = monitor.function.value
+        self._state = None
+        self._is_available = None
 
     @property
     def name(self):
@@ -76,6 +79,11 @@ class ZMSensorMonitors(Entity):
         """Return the state of the sensor."""
         return self._state
 
+    @property
+    def available(self):
+        """Return True if Monitor is available."""
+        return self._is_available
+
     def update(self):
         """Update the sensor."""
         state = self._monitor.function
@@ -83,6 +91,7 @@ class ZMSensorMonitors(Entity):
             self._state = None
         else:
             self._state = state.value
+        self._is_available = self._monitor.is_available
 
 
 class ZMSensorEvents(Entity):
@@ -123,6 +132,7 @@ class ZMSensorRunState(Entity):
     def __init__(self, client):
         """Initialize run state sensor."""
         self._state = None
+        self._is_available = None
         self._client = client
 
     @property
@@ -135,6 +145,12 @@ class ZMSensorRunState(Entity):
         """Return the state of the sensor."""
         return self._state
 
+    @property
+    def available(self):
+        """Return True if ZoneMinder is available."""
+        return self._is_available
+
     def update(self):
         """Update the sensor."""
         self._state = self._client.get_active_state()
+        self._is_available = self._client.is_available

@@ -7,30 +7,39 @@ https://home-assistant.io/components/zha/
 import collections
 import logging
 import os
+import types
 
 import voluptuous as vol
 
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.components.zha.entities import ZhaDeviceEntity
 from homeassistant import config_entries, const as ha_const
+import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.device_registry import CONNECTION_ZIGBEE
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from . import const as zha_const
+from homeassistant.helpers.entity_component import EntityComponent
 
 # Loading the config flow file will register the flow
 from . import config_flow  # noqa  # pylint: disable=unused-import
+from . import const as zha_const
+from .event import ZhaEvent, ZhaRelayEvent
+from . import api
+from .helpers import convert_ieee
+from .entities import ZhaDeviceEntity
 from .const import (
-    DOMAIN, COMPONENTS, CONF_BAUDRATE, CONF_DATABASE, CONF_RADIO_TYPE,
-    CONF_USB_PATH, CONF_DEVICE_CONFIG, ZHA_DISCOVERY_NEW, DATA_ZHA,
-    DATA_ZHA_CONFIG, DATA_ZHA_BRIDGE_ID, DATA_ZHA_RADIO, DATA_ZHA_DISPATCHERS,
-    DATA_ZHA_CORE_COMPONENT, DEFAULT_RADIO_TYPE, DEFAULT_DATABASE_NAME,
-    DEFAULT_BAUDRATE, RadioType
-)
+    COMPONENTS, CONF_BAUDRATE, CONF_DATABASE, CONF_DEVICE_CONFIG,
+    CONF_RADIO_TYPE, CONF_USB_PATH, DATA_ZHA, DATA_ZHA_BRIDGE_ID,
+    DATA_ZHA_CONFIG, DATA_ZHA_CORE_COMPONENT, DATA_ZHA_DISPATCHERS,
+    DATA_ZHA_RADIO, DEFAULT_BAUDRATE, DEFAULT_DATABASE_NAME,
+    DEFAULT_RADIO_TYPE, DOMAIN, ZHA_DISCOVERY_NEW, RadioType,
+    EVENTABLE_CLUSTERS, DATA_ZHA_CORE_EVENTS, ENABLE_QUIRKS,
+    DEVICE_CLASS, SINGLE_INPUT_CLUSTER_DEVICE_CLASS,
+    SINGLE_OUTPUT_CLUSTER_DEVICE_CLASS, CUSTOM_CLUSTER_MAPPINGS,
+    COMPONENT_CLUSTERS)
 
 REQUIREMENTS = [
     'bellows==0.7.0',
     'zigpy==0.2.0',
     'zigpy-xbee==0.1.1',
+    'zha-quirks==0.0.6'
 ]
 
 DEVICE_CONFIG_SCHEMA_ENTRY = vol.Schema({
@@ -48,30 +57,14 @@ CONFIG_SCHEMA = vol.Schema({
         vol.Optional(CONF_DATABASE): cv.string,
         vol.Optional(CONF_DEVICE_CONFIG, default={}):
             vol.Schema({cv.string: DEVICE_CONFIG_SCHEMA_ENTRY}),
+        vol.Optional(ENABLE_QUIRKS, default=True): cv.boolean,
     })
 }, extra=vol.ALLOW_EXTRA)
-
-ATTR_DURATION = 'duration'
-ATTR_IEEE = 'ieee_address'
-
-SERVICE_PERMIT = 'permit'
-SERVICE_REMOVE = 'remove'
-SERVICE_SCHEMAS = {
-    SERVICE_PERMIT: vol.Schema({
-        vol.Optional(ATTR_DURATION, default=60):
-            vol.All(vol.Coerce(int), vol.Range(1, 254)),
-    }),
-    SERVICE_REMOVE: vol.Schema({
-        vol.Required(ATTR_IEEE): cv.string,
-    }),
-}
-
 
 # Zigbee definitions
 CENTICELSIUS = 'C-100'
 
 # Internal definitions
-APPLICATION_CONTROLLER = None
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -102,12 +95,17 @@ async def async_setup_entry(hass, config_entry):
 
     Will automatically load components to support devices found on the network.
     """
-    global APPLICATION_CONTROLLER
-
+    establish_device_mappings()
     hass.data[DATA_ZHA] = hass.data.get(DATA_ZHA, {})
     hass.data[DATA_ZHA][DATA_ZHA_DISPATCHERS] = []
 
     config = hass.data[DATA_ZHA].get(DATA_ZHA_CONFIG, {})
+
+    if config.get(ENABLE_QUIRKS, True):
+        # needs to be done here so that the ZHA module is finished loading
+        # before zhaquirks is imported
+        # pylint: disable=W0611, W0612
+        import zhaquirks  # noqa
 
     usb_path = config_entry.data.get(CONF_USB_PATH)
     baudrate = config.get(CONF_BAUDRATE, DEFAULT_BAUDRATE)
@@ -116,10 +114,12 @@ async def async_setup_entry(hass, config_entry):
         import bellows.ezsp
         from bellows.zigbee.application import ControllerApplication
         radio = bellows.ezsp.EZSP()
+        radio_description = "EZSP"
     elif radio_type == RadioType.xbee.name:
         import zigpy_xbee.api
         from zigpy_xbee.zigbee.application import ControllerApplication
         radio = zigpy_xbee.api.XBee()
+        radio_description = "XBee"
 
     await radio.connect(usb_path, baudrate)
     hass.data[DATA_ZHA][DATA_ZHA_RADIO] = radio
@@ -128,16 +128,40 @@ async def async_setup_entry(hass, config_entry):
         database = config[CONF_DATABASE]
     else:
         database = os.path.join(hass.config.config_dir, DEFAULT_DATABASE_NAME)
-    APPLICATION_CONTROLLER = ControllerApplication(radio, database)
-    listener = ApplicationListener(hass, config)
-    APPLICATION_CONTROLLER.add_listener(listener)
-    await APPLICATION_CONTROLLER.startup(auto_form=True)
 
-    for device in APPLICATION_CONTROLLER.devices.values():
+    # patch zigpy listener to prevent flooding logs with warnings due to
+    # how zigpy implemented its listeners
+    from zigpy.appdb import ClusterPersistingListener
+
+    def zha_send_event(self, cluster, command, args):
+        pass
+
+    ClusterPersistingListener.zha_send_event = types.MethodType(
+        zha_send_event,
+        ClusterPersistingListener
+    )
+
+    application_controller = ControllerApplication(radio, database)
+    listener = ApplicationListener(hass, config)
+    application_controller.add_listener(listener)
+    await application_controller.startup(auto_form=True)
+
+    for device in application_controller.devices.values():
         hass.async_create_task(
             listener.async_device_initialized(device, False))
 
-    hass.data[DATA_ZHA][DATA_ZHA_BRIDGE_ID] = str(APPLICATION_CONTROLLER.ieee)
+    device_registry = await \
+        hass.helpers.device_registry.async_get_registry()
+    device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        connections={(CONNECTION_ZIGBEE, str(application_controller.ieee))},
+        identifiers={(DOMAIN, str(application_controller.ieee))},
+        name="Zigbee Coordinator",
+        manufacturer="ZHA",
+        model=radio_description,
+    )
+
+    hass.data[DATA_ZHA][DATA_ZHA_BRIDGE_ID] = str(application_controller.ieee)
 
     for component in COMPONENTS:
         hass.async_create_task(
@@ -145,25 +169,7 @@ async def async_setup_entry(hass, config_entry):
                 config_entry, component)
         )
 
-    async def permit(service):
-        """Allow devices to join this network."""
-        duration = service.data.get(ATTR_DURATION)
-        _LOGGER.info("Permitting joins for %ss", duration)
-        await APPLICATION_CONTROLLER.permit(duration)
-
-    hass.services.async_register(DOMAIN, SERVICE_PERMIT, permit,
-                                 schema=SERVICE_SCHEMAS[SERVICE_PERMIT])
-
-    async def remove(service):
-        """Remove a node from the network."""
-        from bellows.types import EmberEUI64, uint8_t
-        ieee = service.data.get(ATTR_IEEE)
-        ieee = EmberEUI64([uint8_t(p, base=16) for p in ieee.split(':')])
-        _LOGGER.info("Removing node %s", ieee)
-        await APPLICATION_CONTROLLER.remove(ieee)
-
-    hass.services.async_register(DOMAIN, SERVICE_REMOVE, remove,
-                                 schema=SERVICE_SCHEMAS[SERVICE_REMOVE])
+    api.async_load_api(hass, application_controller, listener)
 
     def zha_shutdown(event):
         """Close radio."""
@@ -175,8 +181,7 @@ async def async_setup_entry(hass, config_entry):
 
 async def async_unload_entry(hass, config_entry):
     """Unload ZHA config entry."""
-    hass.services.async_remove(DOMAIN, SERVICE_PERMIT)
-    hass.services.async_remove(DOMAIN, SERVICE_REMOVE)
+    api.async_unload_api(hass)
 
     dispatchers = hass.data[DATA_ZHA].get(DATA_ZHA_DISPATCHERS, [])
     for unsub_dispatcher in dispatchers:
@@ -192,11 +197,96 @@ async def async_unload_entry(hass, config_entry):
     for entity_id in entity_ids:
         await component.async_remove_entity(entity_id)
 
+    # clean up events
+    hass.data[DATA_ZHA][DATA_ZHA_CORE_EVENTS].clear()
+
     _LOGGER.debug("Closing zha radio")
     hass.data[DATA_ZHA][DATA_ZHA_RADIO].close()
 
     del hass.data[DATA_ZHA]
     return True
+
+
+def establish_device_mappings():
+    """Establish mappings between ZCL objects and HA ZHA objects.
+
+    These cannot be module level, as importing bellows must be done in a
+    in a function.
+    """
+    from zigpy import zcl, quirks
+    from zigpy.profiles import PROFILES, zha, zll
+    from .sensor import RelativeHumiditySensor
+
+    if zha.PROFILE_ID not in DEVICE_CLASS:
+        DEVICE_CLASS[zha.PROFILE_ID] = {}
+    if zll.PROFILE_ID not in DEVICE_CLASS:
+        DEVICE_CLASS[zll.PROFILE_ID] = {}
+
+    EVENTABLE_CLUSTERS.append(zcl.clusters.general.AnalogInput.cluster_id)
+    EVENTABLE_CLUSTERS.append(zcl.clusters.general.LevelControl.cluster_id)
+    EVENTABLE_CLUSTERS.append(zcl.clusters.general.MultistateInput.cluster_id)
+    EVENTABLE_CLUSTERS.append(zcl.clusters.general.OnOff.cluster_id)
+
+    DEVICE_CLASS[zha.PROFILE_ID].update({
+        zha.DeviceType.ON_OFF_SWITCH: 'binary_sensor',
+        zha.DeviceType.LEVEL_CONTROL_SWITCH: 'binary_sensor',
+        zha.DeviceType.REMOTE_CONTROL: 'binary_sensor',
+        zha.DeviceType.SMART_PLUG: 'switch',
+        zha.DeviceType.LEVEL_CONTROLLABLE_OUTPUT: 'light',
+        zha.DeviceType.ON_OFF_LIGHT: 'light',
+        zha.DeviceType.DIMMABLE_LIGHT: 'light',
+        zha.DeviceType.COLOR_DIMMABLE_LIGHT: 'light',
+        zha.DeviceType.ON_OFF_LIGHT_SWITCH: 'binary_sensor',
+        zha.DeviceType.DIMMER_SWITCH: 'binary_sensor',
+        zha.DeviceType.COLOR_DIMMER_SWITCH: 'binary_sensor',
+    })
+    DEVICE_CLASS[zll.PROFILE_ID].update({
+        zll.DeviceType.ON_OFF_LIGHT: 'light',
+        zll.DeviceType.ON_OFF_PLUGIN_UNIT: 'switch',
+        zll.DeviceType.DIMMABLE_LIGHT: 'light',
+        zll.DeviceType.DIMMABLE_PLUGIN_UNIT: 'light',
+        zll.DeviceType.COLOR_LIGHT: 'light',
+        zll.DeviceType.EXTENDED_COLOR_LIGHT: 'light',
+        zll.DeviceType.COLOR_TEMPERATURE_LIGHT: 'light',
+        zll.DeviceType.COLOR_CONTROLLER: 'binary_sensor',
+        zll.DeviceType.COLOR_SCENE_CONTROLLER: 'binary_sensor',
+        zll.DeviceType.CONTROLLER: 'binary_sensor',
+        zll.DeviceType.SCENE_CONTROLLER: 'binary_sensor',
+        zll.DeviceType.ON_OFF_SENSOR: 'binary_sensor',
+    })
+
+    SINGLE_INPUT_CLUSTER_DEVICE_CLASS.update({
+        zcl.clusters.general.OnOff: 'switch',
+        zcl.clusters.measurement.RelativeHumidity: 'sensor',
+        zcl.clusters.measurement.TemperatureMeasurement: 'sensor',
+        zcl.clusters.measurement.PressureMeasurement: 'sensor',
+        zcl.clusters.measurement.IlluminanceMeasurement: 'sensor',
+        zcl.clusters.smartenergy.Metering: 'sensor',
+        zcl.clusters.homeautomation.ElectricalMeasurement: 'sensor',
+        zcl.clusters.general.PowerConfiguration: 'sensor',
+        zcl.clusters.security.IasZone: 'binary_sensor',
+        zcl.clusters.measurement.OccupancySensing: 'binary_sensor',
+        zcl.clusters.hvac.Fan: 'fan',
+    })
+    SINGLE_OUTPUT_CLUSTER_DEVICE_CLASS.update({
+        zcl.clusters.general.OnOff: 'binary_sensor',
+    })
+
+    # A map of device/cluster to component/sub-component
+    CUSTOM_CLUSTER_MAPPINGS.update({
+        (quirks.smartthings.SmartthingsTemperatureHumiditySensor, 64581):
+            ('sensor', RelativeHumiditySensor)
+    })
+
+    # A map of hass components to all Zigbee clusters it could use
+    for profile_id, classes in DEVICE_CLASS.items():
+        profile = PROFILES[profile_id]
+        for device_type, component in classes.items():
+            if component not in COMPONENT_CLUSTERS:
+                COMPONENT_CLUSTERS[component] = (set(), set())
+            clusters = profile.CLUSTERS[device_type]
+            COMPONENT_CLUSTERS[component][0].update(clusters[0])
+            COMPONENT_CLUSTERS[component][1].update(clusters[1])
 
 
 class ApplicationListener:
@@ -208,13 +298,14 @@ class ApplicationListener:
         self._config = config
         self._component = EntityComponent(_LOGGER, DOMAIN, hass)
         self._device_registry = collections.defaultdict(list)
-        zha_const.populate_data()
+        self._events = {}
 
         for component in COMPONENTS:
             hass.data[DATA_ZHA][component] = (
                 hass.data[DATA_ZHA].get(component, {})
             )
         hass.data[DATA_ZHA][DATA_ZHA_CORE_COMPONENT] = self._component
+        hass.data[DATA_ZHA][DATA_ZHA_CORE_EVENTS] = self._events
 
     def device_joined(self, device):
         """Handle device joined.
@@ -243,6 +334,30 @@ class ApplicationListener:
         """Handle device being removed from the network."""
         for device_entity in self._device_registry[device.ieee]:
             self._hass.async_create_task(device_entity.async_remove())
+        if device.ieee in self._events:
+            self._events.pop(device.ieee)
+
+    def get_device_entity(self, ieee_str):
+        """Return ZHADeviceEntity for given ieee."""
+        ieee = convert_ieee(ieee_str)
+        if ieee in self._device_registry:
+            entities = self._device_registry[ieee]
+            entity = next(
+                ent for ent in entities if isinstance(ent, ZhaDeviceEntity))
+            return entity
+        return None
+
+    def get_entities_for_ieee(self, ieee_str):
+        """Return list of entities for given ieee."""
+        ieee = convert_ieee(ieee_str)
+        if ieee in self._device_registry:
+            return self._device_registry[ieee]
+        return []
+
+    @property
+    def device_registry(self) -> str:
+        """Return devices."""
+        return self._device_registry
 
     async def async_device_initialized(self, device, join):
         """Handle device joined and basic information discovered (async)."""
@@ -349,6 +464,22 @@ class ApplicationListener:
                                              device_classes, discovery_attr,
                                              is_new_join):
         """Try to set up an entity from a "bare" cluster."""
+        if cluster.cluster_id in EVENTABLE_CLUSTERS:
+            if cluster.endpoint.device.ieee not in self._events:
+                self._events.update({cluster.endpoint.device.ieee: []})
+            from zigpy.zcl.clusters.general import OnOff, LevelControl
+            if discovery_attr == 'out_clusters' and \
+                    (cluster.cluster_id == OnOff.cluster_id or
+                     cluster.cluster_id == LevelControl.cluster_id):
+                self._events[cluster.endpoint.device.ieee].append(
+                    ZhaRelayEvent(self._hass, cluster)
+                )
+            else:
+                self._events[cluster.endpoint.device.ieee].append(ZhaEvent(
+                    self._hass,
+                    cluster
+                ))
+
         if cluster.cluster_id in profile_clusters:
             return
 

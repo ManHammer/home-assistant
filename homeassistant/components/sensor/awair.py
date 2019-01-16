@@ -20,7 +20,7 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import Throttle, dt
 
-REQUIREMENTS = ['python_awair==0.0.2']
+REQUIREMENTS = ['python_awair==0.0.3']
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -215,6 +215,10 @@ class AwairData:
     async def _async_update(self):
         """Get the data from Awair API."""
         resp = await self._client.air_data_latest(self._uuid)
+
+        if not resp:
+            return
+
         timestamp = dt.parse_datetime(resp[0][ATTR_TIMESTAMP])
         self.attrs[ATTR_LAST_API_UPDATE] = timestamp
         self.data[ATTR_SCORE] = resp[0][ATTR_SCORE]
